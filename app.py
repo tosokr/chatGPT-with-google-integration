@@ -237,6 +237,25 @@ async def init_cosmosdb_client():
 
     return cosmos_conversation_client
 
+async def fetch_bing_results(query):
+    bing_api_key = os.environ.get("BING_API_KEY")
+    if not bing_api_key:
+        raise ValueError("BING_API_KEY is required")
+
+    headers = {
+        "Ocp-Apim-Subscription-Key": bing_api_key
+    }
+    params = {
+        "q": query,
+        "count": 5,
+        "textDecorations": True,
+        "textFormat": "HTML"
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.get("https://api.bing.microsoft.com/v7.0/search", headers=headers, params=params)
+    response.raise_for_status()
+    return response.json()
+
 
 def prepare_model_args(request_body, request_headers):
     request_messages = request_body.get("messages", [])
@@ -251,6 +270,12 @@ def prepare_model_args(request_body, request_headers):
 
     for message in request_messages:
         if message:
+            if message["role"] == "user" and message["content"].startswith("PUBLIC:"):
+                query = message["content"][7:].strip()
+                bing_results = asyncio.run(fetch_bing_results(query))
+                message["content"] = f"Bing results for '{query}': {bing_results}"
+
+ 
             match message["role"]:
                 case "user":
                     messages.append(

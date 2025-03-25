@@ -258,12 +258,12 @@ async def fetch_bing_results(query):
     return response.json()
 
 def extract_prefix (message, prefix):
-    pattern = re.escape + r'\w*'
+    pattern = re.escape(prefix) + r'\w*'
     match = re.match(pattern, message)
     return match.group(0) if match else None
 
 def extract_time_info(message,prefix):
-    if message.startwith(prefix):
+    if message.startswith(prefix):
         match = re.match(rf'{re.escape(prefix)}([dwmy]\d+)', message)
         if match:
             return match.group(1)
@@ -311,7 +311,7 @@ def prepare_model_args(request_body, request_headers):
                 query_prefix = extract_prefix(message["content"], public_query_prefix)
                 date_restrict = extract_time_info(query_prefix, public_query_prefix)
                 query = message["content"].removeprefix(query_prefix)
-                google_results = fetch_google_results(query,time_info)
+                google_results = fetch_google_results(query,date_restrict)
                 prompt =  f'''
                     Provide me with the information I requested. Use the sources to provide an accurate response.
                     Respond in markdown format. Cite the sources you used as a markdown link as you use them at the 

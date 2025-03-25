@@ -35,6 +35,8 @@ from backend.utils import (
     convert_to_pf_format,
     format_pf_non_streaming_response,
 )
+from datetime import datetime
+import re
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
@@ -203,7 +205,6 @@ async def openai_remote_azure_function_call(function_name, function_args):
     async with httpx.AsyncClient() as client:
         response = await client.post(azure_functions_tool_url, data=json.dumps(body), headers=headers)
     response.raise_for_status()
-
     return response.text
 
 async def init_cosmosdb_client():
@@ -256,9 +257,44 @@ async def fetch_bing_results(query):
     response.raise_for_status()
     return response.json()
 
+def extract_prefix (message, prefix):
+    pattern = re.escape + r'\w*'
+    match = re.match(pattern, message)
+    return match.group(0) if match else None
+
+def extract_time_info(message,prefix):
+    if message.startwith(prefix):
+        match = re.match(rf'{re.escape(prefix)}([dwmy]\d+)', message)
+        if match:
+            return match.group(1)
+    return None
+
+def fetch_google_results(query,date_restrict=None):
+    google_api_key = os.environ.get("GOOGLE_API_KEY")
+    google_cx = os.environ.get("GOOGLE_CX")
+    if not google_api_key or not google_cx:
+        raise ValueError("GOOGLE_API_KEY and GOOGLE_CX are required")
+    headers = {
+        "Content-Type": "application/json"
+    }
+    params = {
+        "key": google_api_key,
+        "cx": google_cx,
+        "q": query,
+        "num": 5,
+        "fields": "items(title,link,snippet,image)"	
+    }
+    if date_restrict:
+        params["dateRestrict"] = date_restrict
+    response = httpx.get("https://www.googleapis.com/customsearch/v1", headers=headers, params=params)
+    response.raise_for_status()
+
+    return response.json()
 
 def prepare_model_args(request_body, request_headers):
     request_messages = request_body.get("messages", [])
+    public_query = False
+    public_query_prefix = "@"
     messages = []
     if not app_settings.datasource:
         messages = [
@@ -268,14 +304,36 @@ def prepare_model_args(request_body, request_headers):
             }
         ]
 
-    for message in request_messages:
+    for i, message in enumerate(request_messages):
         if message:
-            if message["role"] == "user" and message["content"].startswith("PUBLIC:"):
-                query = message["content"][7:].strip()
-                bing_results = asyncio.run(fetch_bing_results(query))
-                message["content"] = f"Bing results for '{query}': {bing_results}"
+            if message["role"] == "user" and message["content"].startswith(public_query_prefix) and i == len(request_messages) - 1:
+                public_query = True
+                query_prefix = extract_prefix(message["content"], public_query_prefix)
+                date_restrict = extract_time_info(query_prefix, public_query_prefix)
+                query = message["content"].removeprefix(query_prefix)
+                google_results = fetch_google_results(query,time_info)
+                prompt =  f'''
+                    Provide me with the information I requested. Use the sources to provide an accurate response.
+                    Respond in markdown format. Cite the sources you used as a markdown link as you use them at the 
+                    end of each sentence by number of the source (example: [[1]](link.com)). Make sure the references
+                    are counted properly and are in order. Provide an accurate response and then stop. 
+                    Maximum 10 sentences. Today's date is {datetime.now().strftime("%B %d, %Y")}.
 
- 
+                    Example Input:
+                    What's the weather in San Francisco today?
+
+                    Example Response:
+                    It's 70 degrees and sunny in San Francisco today. [[1]](https://www.google.com/search?q=weather+san+francisco)
+
+                    Input:
+                    {query}
+
+                    Sources:
+                    {google_results}
+
+                '''
+                message["content"] = prompt
+
             match message["role"]:
                 case "user":
                     messages.append(
@@ -322,7 +380,7 @@ def prepare_model_args(request_body, request_headers):
             if app_settings.azure_openai.function_call_azure_functions_enabled and len(azure_openai_tools) > 0:
                 model_args["tools"] = azure_openai_tools
 
-            if app_settings.datasource:
+            if app_settings.datasource and not public_query:
                 model_args["extra_body"] = {
                     "data_sources": [
                         app_settings.datasource.construct_payload_configuration(

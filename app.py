@@ -37,6 +37,8 @@ from backend.utils import (
 )
 from datetime import datetime
 import re
+import requests
+from bs4 import BeautifulSoup
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
@@ -238,25 +240,6 @@ async def init_cosmosdb_client():
 
     return cosmos_conversation_client
 
-async def fetch_bing_results(query):
-    bing_api_key = os.environ.get("BING_API_KEY")
-    if not bing_api_key:
-        raise ValueError("BING_API_KEY is required")
-
-    headers = {
-        "Ocp-Apim-Subscription-Key": bing_api_key
-    }
-    params = {
-        "q": query,
-        "count": 5,
-        "textDecorations": True,
-        "textFormat": "HTML"
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.get("https://api.bing.microsoft.com/v7.0/search", headers=headers, params=params)
-    response.raise_for_status()
-    return response.json()
-
 def extract_prefix (message, prefix):
     pattern = re.escape(prefix) + r'\w*'
     match = re.match(pattern, message)
@@ -268,6 +251,16 @@ def extract_time_info(message,prefix):
         if match:
             return match.group(1)
     return None
+
+def download_page(url):
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        return soup.get_text()
+    except Exception as e:
+        logging.exception("An error occurred while fetching the page")
+        return None
 
 def fetch_google_results(query,date_restrict=None):
     google_api_key = os.environ.get("GOOGLE_API_KEY")
@@ -281,7 +274,7 @@ def fetch_google_results(query,date_restrict=None):
         "key": google_api_key,
         "cx": google_cx,
         "q": query,
-        "num": 5,
+        "num": 10,
         "fields": "items(title,link,snippet,image)"	
     }
     if date_restrict:
@@ -312,6 +305,12 @@ def prepare_model_args(request_body, request_headers):
                 date_restrict = extract_time_info(query_prefix, public_query_prefix)
                 query = message["content"].removeprefix(query_prefix)
                 google_results = fetch_google_results(query,date_restrict)
+                input_prompt=[]
+                if google_results.get("items"):
+                    for item in google_results["items"]:
+                        web_page_content = download_page(item["link"])
+                        if web_page_content:
+                            input_prompt.append({"url": item["link"], "content": web_page_content})
                 prompt =  f'''
                     Provide me with the information I requested. Use the sources to provide an accurate response.
                     Respond in markdown format. Cite the sources you used as a markdown link as you use them at the 
@@ -329,7 +328,7 @@ def prepare_model_args(request_body, request_headers):
                     {query}
 
                     Sources:
-                    {google_results}
+                    {input_prompt}
 
                 '''
                 message["content"] = prompt

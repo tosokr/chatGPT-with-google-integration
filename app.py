@@ -37,14 +37,17 @@ from backend.utils import (
 )
 from datetime import datetime
 import re
-import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, UnicodeDammit
+from urllib.request import urlopen, Request
+import nltk
+from nltk.corpus import stopwords
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
 cosmos_db_ready = asyncio.Event()
 
-
+public_query_prefix = "@"
+    
 def create_app():
     app = Quart(__name__)
     app.register_blueprint(bp)
@@ -240,24 +243,71 @@ async def init_cosmosdb_client():
 
     return cosmos_conversation_client
 
-def extract_prefix (message, prefix):
-    pattern = re.escape(prefix) + r'\w*'
+def extract_prefix (message):
+    pattern = re.escape(public_query_prefix) + r'\w*'
     match = re.match(pattern, message)
     return match.group(0) if match else None
 
-def extract_time_info(message,prefix):
-    if message.startswith(prefix):
-        match = re.match(rf'{re.escape(prefix)}([dwmy]\d+)', message)
+def extract_time_info(message):
+    if message.startswith(public_query_prefix):
+        match = re.match(rf'{re.escape(public_query_prefix)}([dwmy]\d+)', message)
         if match:
             return match.group(1)
     return None
 
+def optimize_google_query(query):
+    # Remove special characters
+    cleaned_query = re.sub(r'[^a-zA-Z0-9\s]', '', query)
+
+    # Tokenize and remove stop words
+    stop_words = set(stopwords.words('english'))
+    tokens = cleaned_query.split()
+    optimized_tokens= [word for word in tokens if word.lower() not in stop_words]
+    
+    # Join back into a string
+    optimized_query = ' '.join(optimized_tokens)
+    
+    return optimized_query
+
+async def ask_model_optimize_query(query):
+    prompt= f"""
+    You are a Google Search Assistant. You receive a prompt as an input and produce and optimized Google search query. 
+    As an output you will return only optimized query. Today's date is {datetime.now().strftime("%B %d, %Y")}
+    
+    input:
+    {query}
+    """
+    request_body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+    try:
+        model_args= prepare_model_args_for_google_query(request_body, {})
+        azure_openai_client = await init_openai_client()
+        raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+        parsed_response = raw_response.parse()
+        return parsed_response.choices[0].message.content
+    except Exception as e:
+        logging.exception("Exception in ask_model_optimize_query")
+        return optimize_google_query(query)
+
 def download_page(url):
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        return soup.get_text()
+        req=Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        html = urlopen(req, timeout=5).read()
+        soup = BeautifulSoup(UnicodeDammit.detwingle(html), features="html.parser")
+        
+        # get text
+        text = soup.get_text(strip=True)
+
+        # break into lines and remove leading and trailing space on each
+        return text[:100000]
+        #return text
+    
     except Exception as e:
         logging.exception("An error occurred while fetching the page")
         return None
@@ -274,8 +324,10 @@ def fetch_google_results(query,date_restrict=None):
         "key": google_api_key,
         "cx": google_cx,
         "q": query,
-        "num": 10,
-        "fields": "items(title,link,snippet,image)"	
+        "num": 5,
+        "fields": "items(title,link,snippet,image)",
+        "lr": "lang_en",
+        "c2coff": "1"
     }
     if date_restrict:
         params["dateRestrict"] = date_restrict
@@ -284,10 +336,120 @@ def fetch_google_results(query,date_restrict=None):
 
     return response.json()
 
-def prepare_model_args(request_body, request_headers):
+async def google_query(request_body):
+    query_prefix = extract_prefix(request_body)
+    date_restrict = extract_time_info(query_prefix)
+    query = request_body.removeprefix(query_prefix)
+    #optimized_query = optimize_google_query(query)
+    optimized_query = await ask_model_optimize_query(query)
+    google_results = fetch_google_results(optimized_query,date_restrict)
+    input_prompt=[]
+    if google_results.get("items"):
+        for item in google_results["items"]:
+            prompt = {
+                "url": item["link"],
+                "snippet": item["snippet"]
+            }
+            web_page_content = download_page(item["link"])                       
+            if web_page_content:
+                prompt["content"] = web_page_content
+            input_prompt.append(prompt)
+    return input_prompt
+
+
+def prepare_model_args_for_google_query (request_body, request_headers):
     request_messages = request_body.get("messages", [])
-    public_query = False
-    public_query_prefix = "@"
+    messages = []
+    
+    for i, message in enumerate(request_messages):
+        if message:
+            match message["role"]:
+                case "user":
+                    messages.append(
+                        {
+                            "role": message["role"],
+                            "content": message["content"]
+                        }
+                    )
+                case "assistant" | "function" | "tool":
+                    messages_helper = {}
+                    messages_helper["role"] = message["role"]
+                    if "name" in message:
+                        messages_helper["name"] = message["name"]
+                    if "function_call" in message:
+                        messages_helper["function_call"] = message["function_call"]
+                    messages_helper["content"] = message["content"]
+                    if "context" in message:
+                        context_obj = json.loads(message["context"])
+                        messages_helper["context"] = context_obj
+                    
+                    messages.append(messages_helper)
+
+
+    user_json = None
+    if (MS_DEFENDER_ENABLED):
+        authenticated_user_details = get_authenticated_user_details(request_headers)
+        conversation_id = request_body.get("conversation_id", None)
+        application_name = app_settings.ui.title
+        user_json = get_msdefender_user_json(authenticated_user_details, request_headers, conversation_id, application_name)
+
+    model_args = {
+        "messages": messages,
+        "temperature": app_settings.azure_openai.temperature,
+        "max_tokens": app_settings.azure_openai.max_tokens,
+        "top_p": app_settings.azure_openai.top_p,
+        "stop": app_settings.azure_openai.stop_sequence,
+        "stream": False,
+        "model": app_settings.azure_openai.model,
+        "user": user_json
+    }
+
+    if len(messages) > 0:
+        if messages[-1]["role"] == "user":
+            if app_settings.azure_openai.function_call_azure_functions_enabled and len(azure_openai_tools) > 0:
+                model_args["tools"] = azure_openai_tools
+
+          
+    model_args_clean = copy.deepcopy(model_args)
+    if model_args_clean.get("extra_body"):
+        secret_params = [
+            "key",
+            "connection_string",
+            "embedding_key",
+            "encoded_api_key",
+            "api_key",
+        ]
+        for secret_param in secret_params:
+            if model_args_clean["extra_body"]["data_sources"][0]["parameters"].get(
+                secret_param
+            ):
+                model_args_clean["extra_body"]["data_sources"][0]["parameters"][
+                    secret_param
+                ] = "*****"
+        authentication = model_args_clean["extra_body"]["data_sources"][0][
+            "parameters"
+        ].get("authentication", {})
+        for field in authentication:
+            if field in secret_params:
+                model_args_clean["extra_body"]["data_sources"][0]["parameters"][
+                    "authentication"
+                ][field] = "*****"
+        embeddingDependency = model_args_clean["extra_body"]["data_sources"][0][
+            "parameters"
+        ].get("embedding_dependency", {})
+        if "authentication" in embeddingDependency:
+            for field in embeddingDependency["authentication"]:
+                if field in secret_params:
+                    model_args_clean["extra_body"]["data_sources"][0]["parameters"][
+                        "embedding_dependency"
+                    ]["authentication"][field] = "*****"
+
+    logging.debug(f"REQUEST BODY: {json.dumps(model_args_clean, indent=4)}")
+
+    return model_args
+
+def prepare_model_args(request_body, request_headers, public_query=False):
+    request_messages = request_body.get("messages", [])
     messages = []
     if not app_settings.datasource:
         messages = [
@@ -299,40 +461,6 @@ def prepare_model_args(request_body, request_headers):
 
     for i, message in enumerate(request_messages):
         if message:
-            if message["role"] == "user" and message["content"].startswith(public_query_prefix) and i == len(request_messages) - 1:
-                public_query = True
-                query_prefix = extract_prefix(message["content"], public_query_prefix)
-                date_restrict = extract_time_info(query_prefix, public_query_prefix)
-                query = message["content"].removeprefix(query_prefix)
-                google_results = fetch_google_results(query,date_restrict)
-                input_prompt=[]
-                if google_results.get("items"):
-                    for item in google_results["items"]:
-                        web_page_content = download_page(item["link"])
-                        if web_page_content:
-                            input_prompt.append({"url": item["link"], "content": web_page_content})
-                prompt =  f'''
-                    Provide me with the information I requested. Use the sources to provide an accurate response.
-                    Respond in markdown format. Cite the sources you used as a markdown link as you use them at the 
-                    end of each sentence by number of the source (example: [[1]](link.com)). Make sure the references
-                    are counted properly and are in order. Provide an accurate response and then stop. 
-                    Maximum 10 sentences. Today's date is {datetime.now().strftime("%B %d, %Y")}.
-
-                    Example Input:
-                    What's the weather in San Francisco today?
-
-                    Example Response:
-                    It's 70 degrees and sunny in San Francisco today. [[1]](https://www.google.com/search?q=weather+san+francisco)
-
-                    Input:
-                    {query}
-
-                    Sources:
-                    {input_prompt}
-
-                '''
-                message["content"] = prompt
-
             match message["role"]:
                 case "user":
                     messages.append(
@@ -500,12 +628,39 @@ async def process_function_call(response):
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
-    for message in messages:
-        if message.get("role") != 'tool':
-            filtered_messages.append(message)
+    for i,message in enumerate(messages):
+        if message:
+            if message.get("role") != 'tool':
+                if message["role"] == "user" and message["content"].startswith(public_query_prefix) and i == len(messages)-1:
+                    public_query = True
+                    sources = await google_query(message["content"])
+                    query = message["content"].removeprefix(extract_prefix(message["content"]))
+                        
+                    prompt =  f'''
+                        Provide me with the information I requested. Use the sources to provide an accurate response.
+                        Respond in markdown format. Cite the sources you used as a markdown link as you use them at the 
+                        end of each sentence by number of the source (example: [[1]](link.com)). Make sure the references
+                        are counted properly and are in order. Provide an accurate response and then stop. 
+                        Maximum 10 sentences. Today's date is {datetime.now().strftime("%B %d, %Y")}.
+
+                        Example Input:
+                        What's the weather in San Francisco today?
+
+                        Example Response:
+                        It's 70 degrees and sunny in San Francisco today. [[1]](https://www.google.com/search?q=weather+san+francisco)
+
+                        Input:
+                        {query}
+
+                        Sources:
+                        {sources}
+
+                    '''
+                    message["content"] = prompt
+                filtered_messages.append(message)
             
     request_body['messages'] = filtered_messages
-    model_args = prepare_model_args(request_body, request_headers)
+    model_args = prepare_model_args(request_body, request_headers,public_query)
 
     try:
         azure_openai_client = await init_openai_client()
@@ -1138,5 +1293,5 @@ async def generate_title(conversation_messages) -> str:
         logging.exception("Exception while generating title", e)
         return messages[-2]["content"]
 
-
+nltk.download("stopwords")
 app = create_app()

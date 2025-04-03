@@ -36,11 +36,8 @@ from backend.utils import (
     format_pf_non_streaming_response,
 )
 from datetime import datetime
-import re
 from bs4 import BeautifulSoup, UnicodeDammit
 from urllib.request import urlopen, Request
-import nltk
-from nltk.corpus import stopwords
 
 from backend.google import (
     google_query,

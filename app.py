@@ -289,6 +289,7 @@ async def optimize_google_query_with_ai_model(query):
         model_args= prepare_model_args(request_body, {})
         model_args["stream"] = False
         model_args["extra_body"] = None
+        model_args["temperature"] = 0.2
         azure_openai_client = await init_openai_client()
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
         parsed_response = raw_response.parse()
@@ -297,10 +298,48 @@ async def optimize_google_query_with_ai_model(query):
         logging.exception("Exception in ask_model_optimize_query")
         return optimize_google_query(query)
 
+async def generate_google_query_parameters_with_ai_model(query):
+    prompt= f"""
+    You are an assistant that receives a prompt as an input. Because you don't have the knowledge, from the input you identify the optimal Google query you need in order to answer the prompt. 
+    You generate a json object containing the parameters that you should use for Google custom search. 
+    You should include the following parameters in the json:
+    - q: The search query
+    - num: The number of results to return (default is 5)
+    - dateRestrict: The date range for the search results (optional)
+    In addition, add a new key called "prompt" to the json object, which should contain a user prompt I can send to a GPT model so that the model can answer my query.
+    Today's date is {datetime.now().strftime("%B %d, %Y")}
+    
+    input:
+    {query}
+    """
+    request_body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+    try:
+        model_args= prepare_model_args(request_body, {})
+        model_args["stream"] = False
+        model_args["extra_body"] = None
+        azure_openai_client = await init_openai_client()
+        raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+        parsed_response = raw_response.parse()
+        # convert to json object 
+        json_string = re.sub(r'\n','',re.sub(r'```', '', re.sub(r'```json\n', '', parsed_response.choices[0].message.content)))
+        # string to json object
+        return json.loads(json_string)
+    except Exception as e:
+        logging.exception("Exception in ask_model_optimize_query")
+        return optimize_google_query(query)
+
+
 async def preprocess_page_content_with_ai_model(content, query):
     prompt= f"""
-    Provide me with the information I requested. Use only the sources to provide an response.
-    If the source is not enough to provide the requested information, please respond with an empty string.
+    Provide me with the information I requested, specified in Input. Use only the Sources to provide an response.
+    If the Sources is not enough to provide the requested information, please respond with an empty string.
     Today's date is {datetime.now().strftime("%B %d, %Y")}.
 
     Example Input:
@@ -327,6 +366,7 @@ async def preprocess_page_content_with_ai_model(content, query):
         model_args= prepare_model_args(request_body, {})
         model_args["stream"] = False
         model_args["extra_body"] = None
+        model_args["temperature"] = 0
         azure_openai_client = await init_openai_client()
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
         parsed_response = raw_response.parse()
@@ -364,8 +404,8 @@ def fetch_google_results(query,date_restrict=None):
         "key": google_api_key,
         "cx": google_cx,
         "q": query,
-        "num": 5,
-        "fields": "items(title,link,snippet,image)",
+        "num": 8,
+        "fields": "items(title,link,snippet)",
         "lr": "lang_en",
         "c2coff": "1"
     }
@@ -376,22 +416,44 @@ def fetch_google_results(query,date_restrict=None):
 
     return response.json()
 
+def fetch_google_results_new(query_parameters):
+    google_api_key = os.environ.get("GOOGLE_API_KEY")
+    google_cx = os.environ.get("GOOGLE_CX")
+    if not google_api_key or not google_cx:
+        raise ValueError("GOOGLE_API_KEY and GOOGLE_CX are required")
+    headers = {
+        "Content-Type": "application/json"
+    }
+    query_parameters["key"] = google_api_key
+    query_parameters["cx"] = google_cx
+    query_parameters["fields"] = "items(title,link,snippet)"
+    query_parameters["lr"] = "lang_en"
+    response = httpx.get("https://www.googleapis.com/customsearch/v1", headers=headers, params=query_parameters)
+    response.raise_for_status()
+
+    return response.json()
+
 async def google_query(request_body):
-    query_prefix = extract_prefix(request_body)
-    date_restrict = extract_time_info(query_prefix)
-    query = request_body.removeprefix(query_prefix)
-    optimized_query = await optimize_google_query_with_ai_model(query)
-    google_results = fetch_google_results(optimized_query,date_restrict)
+    #query_prefix = extract_prefix(request_body)
+    #date_restrict = extract_time_info(query_prefix)
+    #query = request_body.removeprefix(query_prefix).strip()
+    #optimized_query = await optimize_google_query_with_ai_model(query)
+    query = request_body.removeprefix(public_query_prefix).strip()
+    google_query_parameters = await generate_google_query_parameters_with_ai_model(query)
+    optimized_prompt = google_query_parameters.get("prompt")
+    google_query_parameters["prompt"] = None
+    google_results = fetch_google_results_new(google_query_parameters)
     input_prompt=[]
     if google_results.get("items"):
         for item in google_results["items"]:
             prompt = {
-                "url": item["link"],
-                "snippet": item["snippet"]
+                "url": item["link"]
             }
             web_page_content =  download_page(item["link"])                      
             if web_page_content:
-                prompt["content"] = await preprocess_page_content_with_ai_model(web_page_content,query)
+                prompt["content"] = await preprocess_page_content_with_ai_model(web_page_content,optimized_prompt)
+            else:
+                prompt["content"] = item["snippet"]    
             input_prompt.append(prompt)
     return input_prompt
 
@@ -612,6 +674,8 @@ async def send_chat_request(request_body, request_headers):
     if public_query:
         # remove the datasource from the model args
         model_args["extra_body"] = None
+        model_args["temperature"] = 0
+        model_args["top_p"] = None
 
     try:
         azure_openai_client = await init_openai_client()
@@ -1244,5 +1308,4 @@ async def generate_title(conversation_messages) -> str:
         logging.exception("Exception while generating title", e)
         return messages[-2]["content"]
 
-nltk.download("stopwords")
 app = create_app()

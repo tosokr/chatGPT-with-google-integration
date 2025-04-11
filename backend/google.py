@@ -9,6 +9,9 @@ import os
 import sys
 import concurrent.futures
 
+from lxml import etree
+
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 global public_query_prefix
@@ -27,6 +30,7 @@ def extract_time_info(message):
             return match.group(1)
     return None
 
+        
 async def generate_google_query_parameters_with_ai_model(query):
     from app import prepare_model_args, init_openai_client
     prompt= f"""
@@ -111,8 +115,8 @@ def download_page(url):
     try:
         req=Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         html = urlopen(req, timeout=20).read()
-        soup = BeautifulSoup(UnicodeDammit.detwingle(html), features="html.parser")
-        
+        #soup = BeautifulSoup(UnicodeDammit.detwingle(html), features="html.parser")
+        soup = BeautifulSoup(UnicodeDammit.detwingle(html), features="lxml")
         # get text
         text = soup.get_text(strip=True)
 
@@ -136,6 +140,7 @@ def fetch_google_results(query_parameters):
     query_parameters["key"] = google_api_key
     query_parameters["cx"] = google_cx
     query_parameters["fields"] = "items(title,link,snippet)"
+    query_parameters["hl"] = "en"
     #query_parameters["lr"] = "lang_en"
     response = httpx.get("https://www.googleapis.com/customsearch/v1", headers=headers, params=query_parameters)
     response.raise_for_status()
@@ -168,18 +173,6 @@ async def google_query(request_body):
                     except Exception as e:
                         logging.exception("An error occurred while processing the page")
                         continue
-
-       
-        #    # for item in google_results["items"]:
-        #    #     prompt = {
-        #    #         "url": item["link"]
-        #    #     }
-        #    #     web_page_content =  download_page(item["link"])                      
-        #    #     if web_page_content:
-        #    #         prompt["content"] = await preprocess_page_content_with_ai_model(web_page_content,optimized_prompt)
-        #    #     else:
-        #    #         prompt["content"] = item["snippet"]    
-        #    #     sources.append(prompt)
         return sources, optimized_prompt 
     else:
         return None

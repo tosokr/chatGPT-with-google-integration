@@ -166,7 +166,6 @@ async def google_query(request_body):
                         prompt = {"url": item["link"]}
                         if web_page_content:
                             prompt["content"] = await preprocess_page_content_with_ai_model(web_page_content, optimized_prompt)
-                            prompt["content"] = web_page_content
                         else:
                             prompt["content"] = item["snippet"]
                         sources.append(prompt)
